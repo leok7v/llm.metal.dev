@@ -154,4 +154,5 @@ MetalErrorCode metalSgemmBatched(bool leftT, bool rightT, size_t leftRows,
                                  size_t leftCols, size_t rightRows,
                                  size_t rightCols, float *A, float *B, float *C,
                                  size_t batchCount, float alpha, float beta);
+MetalErrorCode metalClearBuffer(void* buffer_base_ptr, size_t total_size_bytes);
 #endif /* metal_h */

@@ -339,3 +339,96 @@ MetalErrorCode metalSgemmBatched(bool leftT, bool rightT,
   gMetalState.encoder = [buf computeCommandEncoder];
   return MetalSuccess;
 }
+
+/*
+
+   Description: Clears (zeroes out) a specified portion of a metal buffer.
+
+*/
+MetalErrorCode metalClearBuffer(void* buffer_base_ptr, size_t total_size_bytes)
+{
+    if (!gMetalState.device) {
+        returnError(MetalErrorFailedToLocateBuffer);
+    }
+
+    if (total_size_bytes == 0)
+        return MetalSuccess;
+
+    /*
+         Find the actual metal Buffer Object (MTLBuffer) from the user-provided (buffer_base_ptr)
+    */
+
+    BufferInfo info = findBufferInfo(buffer_base_ptr);
+
+    if (!info.buffer)
+    {
+        returnError(MetalErrorFailedToLocateBuffer);
+    }
+
+    size_t buffer_actual_length = info.buffer.length;
+
+    if (total_size_bytes > buffer_actual_length){
+        returnError(MetalErrorInvalidArgument);
+    }
+
+    /*
+        If there are any previous compute commands --> we want to send them off to the GPU first
+    */
+    if (gMetalState.encoder)
+    {
+        MetalErrorCode commitCode = metalCommitCommands();
+        if (commitCode != MetalSuccess)
+            returnError(commitCode);
+
+        [gMetakState.encoder endEncoding];
+         gMetalState.encoder = nil;
+    } else {
+        if (!gMetalState.commandBuffers || gMetalState.commandBuffers.count == 0) {
+            //create a new command buffer
+            id<MTLCommandBuffer> first_ever_cmd_buffer = createCommandBuffer();
+            if (!first_ever_cmd_buffer)
+                returnError(MetalErrorCommandBufferCreationFailed);
+        }
+    }
+
+    //get the command buffer and we will add Blit command to
+    //blit --> Block image transfer (to fill block of texture or buffer memory)
+    // the active commadn buffer is always the last one
+    id<MTLCommandBuffer> commandBuffer = [gMetalState.commandBuffers lastObject];
+    if (!currentCmdBuffer){
+       returnError(MetalErrorCommandBufferCreationFailed);
+    }
+
+    @autoreleasepool {
+         id<MTLBlitCommandEncoder> blitEncoder = [currentCmdBuffer blitCommandEncoder];
+         if (!blitEncoder){
+             returnError(MetalErrorCommandBufferCreationFailed);
+         }
+
+         //fill user-specified range of the buffer with 0
+         [blitEncoder fillBuffer:info.buffer
+                        range:NSMakeRange(0, total_size_bytes)
+                        value:0];
+
+         [blitEncoder endEncoding];
+    }
+
+    //commit the command buffer
+    [currentCmdBuffer commit];
+
+    //remove the committed buffer
+    [gMetalSate.commandBuffers removeObject:currentCmdBuffer];
+
+    //Create a new command buffer and comptue encoder for subsequent compute tasks
+    id<MTLCommandBuffer> nextCmdBuffer = createCommandBuffer();
+    if (!nextCmdBuffer) {
+        returnError(MetalErrorCommandBufferCreationFailed);
+    }
+
+    gMetalState.encoder = [nextCmdBuffer computeCommandEncoder];
+    if (!gMetalState.encoder) {
+        returnError(MetalErrorCommandBufferCreationFailed);
+    }
+
+    return MetalSuccess;
+}
