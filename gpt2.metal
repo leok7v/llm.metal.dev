@@ -428,7 +428,8 @@ kernel void crossentropy_forward_kernel1(device float* losses [[ buffer(0) ]],
   uint t = tid % T;
   device float* probs_bt = probs + b * T * V + t * V;
   int ix = targets[b * T + t];
-  losses[b * T + t] = -log(probs_bt[ix]);
+  constexpr float k_eps = 1e-30f;
+  losses[b * T + t] = -log (fmax(probs_bt[ix], k_eps));
 }
 
 /*
@@ -778,7 +779,7 @@ kernel void layernorm_backward_kernel(
 #define GELU_SCALING_FACTOR sqrt(2.0f/M_PI_F)
 
 kernel void gelu_backward_kernel(
-    device float *dinp,
+    device atomic_float *dinp,
     device const float* inp,
     device const float* dout,
     constant const int &N,
@@ -804,7 +805,8 @@ kernel void gelu_backward_kernel(
                 + 0.5f * x * sech2_s * GELU_SCALING_FACTOR * (1.0f + 3.0f * 0.044715 * x2);
 
     //accumulate into dinp
-    dinp[gid] += gelu_grad * dy;
+    float dx = gelu_grad * dy;
+    atomic_fetch_add_explicit(&dinp[gid], dx, memory_order_relaxed);
 }
 
 /*
@@ -909,7 +911,7 @@ kernel void adamw_kernel(
 
     if (!isfinite(m_hat) || !isfinite(v_hat) || v_hat < 0.0f) return;
 
-    float denom = sqrt(v_hat) + eps;
+    float denom = sqrt(fmax(v_hat, 1e-30f)) + eps;
     if (!isfinite(denom) || denom < 1e-10f) return;
 
     float update = fma(wd, p, m_hat/denom);
@@ -917,8 +919,8 @@ kernel void adamw_kernel(
 }
 
 kernel void residual_backward_kernel(
-    device float *dinp1,
-    device float *dinp2,
+    device atomic_float *dinp1,
+    device atomic_float *dinp2,
     device const float *dout,
     constant const int &N,
     uint gid [[thread_position_in_grid]])
@@ -926,8 +928,10 @@ kernel void residual_backward_kernel(
     if (gid >= N) return;
 
     float dy = dout [gid]; //upstream gradient
-    dinp1[gid] += dy;
-    dinp2[gid] += dy;
+    //dinp1[gid] += dy;
+    //dinp2[gid] += dy;
+    atomic_fetch_add_explicit(&dinp1[gid], dy, memory_order_relaxed);
+    atomic_fetch_add_explicit(&dinp2[gid], dy, memory_order_relaxed);
 }
 
 kernel void initialize_dlosses_kernel(

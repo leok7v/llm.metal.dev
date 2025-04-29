@@ -645,27 +645,35 @@ typedef struct {
 float *malloc_and_point_activations(ActivationTensors *acts,
                                     size_t *act_sizes) {
   size_t num_activations = 0;
-  for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
+  for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++)
     num_activations += act_sizes[i];
-  }
+
   float *acts_memory = NULL;
-  metalCheck(
-      metalMalloc((void **)&acts_memory, num_activations * sizeof(float)));
-  float **ptrs[] = {
-      &acts->logits,   &acts->encoded,   &acts->ln1,       &acts->ln1_mean,
-      &acts->ln1_rstd, &acts->qkv,       &acts->atty,      &acts->preatt,
-      &acts->att,      &acts->attproj,   &acts->residual2, &acts->ln2,
-      &acts->ln2_mean, &acts->ln2_rstd,  &acts->fch,       &acts->fch_gelu,
-      &acts->fcproj,   &acts->residual3, &acts->lnf,       &acts->lnf_mean,
-      &acts->lnf_rstd, &acts->probs,     &acts->losses,    &acts->qkvr,
-      &acts->v_accum};
-  float *acts_memory_iterator = acts_memory;
-  for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
-    *(ptrs[i]) = acts_memory_iterator;
-    acts_memory_iterator += act_sizes[i];
+  metalCheck(metalMalloc((void**)&acts_memory,
+                         num_activations * sizeof(float)));
+
+  /*  ⚠️  KEEP THIS LIST EXACTLY IN SYNC WITH ActivationTensors  */
+  float **ptrs[NUM_ACTIVATION_TENSORS] = {
+    &acts->logits,     &acts->encoded,   &acts->ln1,        &acts->ln1_mean,
+    &acts->ln1_rstd,   &acts->qkv,       &acts->atty,       &acts->preatt,
+    &acts->att,        &acts->attproj,   &acts->residual2,  &acts->ln2,
+    &acts->ln2_mean,   &acts->ln2_rstd,  &acts->fch,        &acts->fch_gelu,
+    &acts->fcproj,     &acts->residual3, &acts->lnf,        &acts->lnf_mean,
+    &acts->lnf_rstd,   &acts->probs,     &acts->losses,     &acts->qkvr,
+    &acts->v_accum,    &acts->dpreatt,   &acts->datt        // << NEW
+};
+
+  static_assert(NUM_ACTIVATION_TENSORS == sizeof(ptrs)/sizeof(ptrs[0]),
+                "ptrs list must match NUM_ACTIVATION_TENSORS");
+
+  float *it = acts_memory;
+  for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; ++i) {
+    *ptrs[i] = it;
+    it += act_sizes[i];
   }
   return acts_memory;
 }
+
 
 typedef struct {
   int max_seq_len; // max sequence length, e.g. 1024
@@ -727,7 +735,7 @@ void crossentropy_softmax_backward(GPT2 * model)
                 Buffer, targets,
                 Scalar, &B,
                 Scalar, &T,
-                Scalar &V);
+                Scalar, &V);
 }
 
 void gpt2_build_from_checkpoint(GPT2 *model, char *checkpoint_path) {
@@ -1158,6 +1166,7 @@ void gpt2_backward(GPT2 *model) {
                            dl_ln1, l_residual_in, l_ln1w,
                            l_ln1_mean, l_ln1_rstd,
                            B, T, C);
+      metalCommitCommands();
     }
 
   //Backprop through Encoder
@@ -1212,9 +1221,6 @@ void gpt2_free(GPT2 *model) {
   metalCheck(metalFree(model->grads_acts_memory));
   metalCheck(metalFree(model->m_memory));
   metalCheck(metalFree(model->v_memory));
-  metalCheck(metalFree(model->inputs));
-  metalCheck(metalFree(model->targets));
-  metalCheck(metalFree(model->acts_memory));
 }
 
 #ifndef TESTING
@@ -1430,8 +1436,7 @@ int main(void) {
               "crossentropy_forward_kernel1", "scale_kernel",
               "softmax_forward_kernel1",
               "crossentropy_softmax_backward_kernel",
-              "softmax_backward_kernel",
-              "matmul_backward_bias_kernel_fixed",
+              "matmul_backward_bias_kernel",
               "layernorm_backward_kernel",
               "residual_backward_kernel",
               "gelu_backward_kernel",
@@ -1530,7 +1535,7 @@ int main(void) {
     // these are still TODO
     gpt2_zero_grad(&model);
     gpt2_backward(&model);
-    gpt2_update(&model, 1e-4f, 0.9f, 0.999f, 1e-8f, 0.0f, step+1);
+    gpt2_update(&model, 3e-5f, 0.9f, 0.999f, 1e-8f, 0.0f, step+1);
     clock_gettime(CLOCK_MONOTONIC, &end);
     double time_elapsed_s =
         (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
