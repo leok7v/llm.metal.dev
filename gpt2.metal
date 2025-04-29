@@ -874,7 +874,7 @@ kernel void encoder_backward_kernel(
     atomic_fetch_add_explicit(&dwpe[wpe_index], d, memory_order_relaxed);
 }
 
-kernel void adamw_kernel_opt(
+kernel void adamw_kernel(
     device float *params,
     device const float *grads,
     device float *m_memory,
