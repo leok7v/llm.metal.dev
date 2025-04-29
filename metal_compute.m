@@ -380,7 +380,7 @@ MetalErrorCode metalClearBuffer(void* buffer_base_ptr, size_t total_size_bytes)
         if (commitCode != MetalSuccess)
             returnError(commitCode);
 
-        [gMetakState.encoder endEncoding];
+        [gMetalState.encoder endEncoding];
          gMetalState.encoder = nil;
     } else {
         if (!gMetalState.commandBuffers || gMetalState.commandBuffers.count == 0) {
@@ -394,7 +394,7 @@ MetalErrorCode metalClearBuffer(void* buffer_base_ptr, size_t total_size_bytes)
     //get the command buffer and we will add Blit command to
     //blit --> Block image transfer (to fill block of texture or buffer memory)
     // the active commadn buffer is always the last one
-    id<MTLCommandBuffer> commandBuffer = [gMetalState.commandBuffers lastObject];
+    id<MTLCommandBuffer> currentCmdBuffer = [gMetalState.commandBuffers lastObject];
     if (!currentCmdBuffer){
        returnError(MetalErrorCommandBufferCreationFailed);
     }
@@ -417,7 +417,7 @@ MetalErrorCode metalClearBuffer(void* buffer_base_ptr, size_t total_size_bytes)
     [currentCmdBuffer commit];
 
     //remove the committed buffer
-    [gMetalSate.commandBuffers removeObject:currentCmdBuffer];
+    [gMetalState.commandBuffers removeObject:currentCmdBuffer];
 
     //Create a new command buffer and comptue encoder for subsequent compute tasks
     id<MTLCommandBuffer> nextCmdBuffer = createCommandBuffer();

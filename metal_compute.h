@@ -48,6 +48,7 @@ typedef enum MetalErrorCode {
   MetalErrorSetPipelineFailed,
   MetalErrorNotInitialized,
   MetalErrorBindArgFailed,
+  MetalErrorInvalidArgument,
   MetalErrorCount // Should always be last
 } MetalErrorCode;
 
@@ -71,6 +72,7 @@ static const char *MetalErrorStrings[MetalErrorCount] = {
     "Failed to create MPSMatrixMultiplication.",
     "Failed to set pipeline state on command encoder.",
     "Metal state is not yet initialized.",
+    "Invalid argument provided.",
     "Failed to bind an argument to kernel function."};
 
 void __metalCheck(MetalErrorCode error, const char *file, int line);

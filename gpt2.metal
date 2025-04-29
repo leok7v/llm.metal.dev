@@ -430,3 +430,551 @@ kernel void crossentropy_forward_kernel1(device float* losses [[ buffer(0) ]],
   int ix = targets[b * T + t];
   losses[b * T + t] = -log(probs_bt[ix]);
 }
+
+/*
+    this kernel calculates the gradient of the cross entropy loss function with respect
+    to the inputs of the softmax layer (logits).
+
+    Take the output probabilities from the forward pass's softmax, the true target labels
+    and the incoming gradients signal (dlosses).
+
+    Idea is to compute how much each logit must change to reduce the loss
+
+*/
+kernel void crossentropy_softmax_backward_kernel(
+    // output gradients
+    device float * dlogits [[buffer(0)]], // (B.T.V)
+
+    //inputs
+    device const float *dlosses [[buffer(1)]], // (B.T)
+    device const float *probs [[buffer(2)]], // (B.T.V) from softmax
+    device const int *targets [[buffer(3)]], // (B.T)
+
+    //scalars
+    constant int& B [[buffer(4)]],
+    constant int& T [[buffer(5)]],
+    constant int& V [[buffer(6)]],
+
+    //launch info
+    uint gid [[thread_position_in_grid]]
+){
+
+    //guard threads outside the tensor
+    const uint N = static_cast<uint>(B) * static_cast<uint>(T) * static_cast<uint>(V);
+
+    if (gid >= N)   return;
+
+
+    //decode the flattened index
+    const uint i = gid % V; //slot in vocabulary
+    const uint t = (gid/V) % T; //time step
+    const uint b = gid / (V * T); // batch element
+    const uint bt = b * T + t;
+
+    //inputs
+    const int target = targets[bt];
+    const float p_raw = probs[gid];
+
+    //clamp p to avoid gradient blow ups when p is close to 0
+    constexpr float k_eps = 1e-30f;
+    const float p = fmax(p_raw, k_eps);
+
+    const float indicator = (i == static_cast<uint>(target))? 1.0f : 0.0f;
+    const float gradient = (p - indicator) * dlosses[bt];
+
+    // write back
+    dlogits[gid] += gradient;
+}
+
+/*
+    Big picture: FC layer has a bias vector b (Len = OC)
+            Here we accumulate dbias across {b,t} (for all output channels j)
+    One thread-group processes VEC_SIZE(4) consecutive channels
+    Strategy:
+        Each thread accumulates its own partial sums for those 4 channels
+        SIMD-group (warp) wide reduction with simd_sum();
+        Cross-SIMD reduction through threadgroup memory
+        Thread-0 atomically adds results into global dbias
+*/
+
+kernel void matmul_backward_bias_kernel(
+    //output bias gradient vector (length OC) --> uses atomic adds
+    device atomic_float *dbias [[buffer(0)]],
+
+    //upstream gradient tensor flattened as (B*T*OC)
+    device const float *dout [[buffer(1)]],
+
+    constant int& B [[buffer(2)]],
+    constant int& T [[buffer(3)]],
+    constant int& OC [[buffer(4)]],
+
+    //threadgroup 0's scratchpad memory (c uda smem per block) bug enough for VEC_SIZE * simd_groups_per_block floats
+    threadgroup float* local_sums [[threadgroup(0)]],
+
+    //thread, warp, group identifiers
+    uint tix [[thread_index_in_threadgroup]],
+    uint group_id [[threadgroup_position_in_grid]],
+    ushort block_size [[threads_per_threadgroup]],
+    uint simd_lane_id [[thread_index_in_simdgroup]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]],
+    uint simd_groups_per_block [[simdgroups_per_threadgroup]],
+    uint simd_size [[thread_execution_width]]
+){
+    constexpr ushort VEC_SIZE = 4;
+
+    //which 4 channel slice this thread-group owns
+    uint o_base = group_id * VEC_SIZE;
+    if (o_base >= OC) return;
+
+    int total_elems = B * T;
+    if (total_elems == 0) return;
+
+    //per-thread partial sums intialized to zero
+    float thread_sums[VEC_SIZE] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    //grid-stride loop over B * T elements
+    // each iteration handles one (b,t) for this thread
+    for (int idx = int(tix); idx < total_elems; idx += int(block_size))
+    {
+        //pointer to the start of row (b, t) inside dout
+        const device float *row_ptr = dout + idx * OC;
+
+        //accumulate all of 4 channels
+        #pragma unroll
+        for (ushort k = 0; k < VEC_SIZE; ++k)
+        {
+            uint ch = o_base + k; //channel idx
+            if (ch < OC)
+            {
+                float val = row_ptr[ch];
+                if (!isnan(val) && !isinf(val))
+                    thread_sums[k] += val;
+            }
+        }
+    }
+
+    //first reduction stage inside each SIMD warp
+    //simd_sum() returns the sum of the value across all lanes in the warp
+    float warp_sums[VEC_SIZE];
+    for (ushort k = 0; k < VEC_SIZE; k++)
+    {
+        warp_sums[k] = simd_sum(thread_sums[k]);
+    }
+
+    //lane 0 writes the warp subttotal into threadgroup memory
+    if (simd_lane_id == 0)
+    {
+        #pragma unroll
+        for (ushort k = 0; k < VEC_SIZE; k++)
+        {
+            uint offset = k * simd_groups_per_block + simd_group_id;
+            local_sums[offset] = warp_sums[k];
+        }
+    }
+
+    //synchronize
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    //second reduction --> sum across warps
+    float final_sums[VEC_SIZE] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    //only first warp will do this
+    if (simd_group_id == 0)
+    {
+        #pragma unroll
+        for (ushort k = 0; k < VEC_SIZE; k++)
+        {
+            //each lane i loads the subtotal written by warp i
+            float subtotal = (tix < simd_groups_per_block) ? local_sums[k*simd_groups_per_block + tix] : 0.0f;
+
+        //reduce subtotals inside this warp again
+        subtotal = simd_sum(subtotal);
+
+        //lane - now has block-wide sum for channel k
+        if (simd_lane_id == 0)
+            final_sums[k] = subtotal;
+        }
+    }
+
+    //now thread 0 of entire block performs atomic adds
+
+    if (tix == 0)
+    {
+        #pragma unroll
+        for (ushort k = 0; k < VEC_SIZE; k++)
+        {
+            uint ch = o_base + k;
+            if (ch < OC)
+            {
+                float v = final_sums[k];
+                if (!isnan(v) && !isinf(v))
+                    atomic_fetch_add_explicit(&dbias[ch], v, memory_order_relaxed);
+            }
+        }
+    }
+}
+
+/*
+    Layer Normalization kernel
+
+    What it computes:
+        For one specific (b,t) sample, i.e. one row of the tensor with length C
+        inp_row = inp [b, t, :] normalized values
+        dout_row = dout [b, t, :] (gradients coming in from next layer)
+        mean_bt = mean[b, t] (saved in forward pass)
+        rstd_bt = rstd [b, t] (saved in forward pass)
+
+    It produces
+        dinp_row (gradient with respect to each element
+        dweights
+        dbias
+
+    Parallel Strategy
+        Grid Dim.x = B * T -> one thread-group per (b, t) row
+        each thread strides over the channel dimension C
+            i = threadIdx; i += blockDim until i >=C
+            accumulating the two partial sums
+        First reduction -> inside each SIMD-group -> gens 1 float per warp
+        Second reduction -> across warps via shared memory -> gens 1 float for block
+
+        Both these floats get divided by C to form the means above
+
+        Every thread re-scans its portion of channels and writes dinp
+
+        dweight/dbias requires atomic adds as many thread groups update these concurrently
+*/
+kernel void layernorm_backward_kernel(
+   device atomic_float * dinp [[buffer(0)]],
+   device atomic_float* dweight [[buffer(1)]],
+   device atomic_float* dbias [[buffer(2)]],
+   device const float * dout [[buffer(3)]],
+   device const float *inp [[buffer(4)]],
+   device const float *weight [[buffer(5)]],
+   device const float *mean [[buffer(6)]],
+   device const float* rstd [[buffer(7)]],
+   //usual
+   constant const int &B [[buffer(8)]],
+   constant const int &T [[buffer(9)]],
+   constant const int &C [[buffer(10)]],
+   threadgroup float * shared_mem [[threadgroup(0)]],
+
+   uint tix [[thread_index_in_threadgroup]],
+   uint bid [[threadgroup_position_in_grid]],
+   ushort block_size [[threads_per_threadgroup]],
+   uint simd_lane_id [[thread_index_in_simdgroup]],
+   uint simd_group_id [[simdgroup_index_in_threadgroup]],
+   uint simd_groups_per_block [[simdgroups_per_threadgroup]],
+   uint simd_size [[thread_execution_width]])
+{
+    const int bt_index = int(bid);
+    const int bt_offset = bt_index * C;
+
+    float mean_bt = mean [bt_index];
+    float rstd_bt = rstd [bt_index];
+
+    if (isnan(mean_bt) || isnan(rstd_bt) || isinf(mean_bt) || isinf(rstd_bt) ||
+            rstd_bt <= 1e-10f || C == 0)    return;
+
+    //scan over all channels and accumulate warp-local dnorm
+    float dnorm_sum = 0.0f;
+    float dnorm_xhat_sum = 0.0f;
+
+    for (int i = int(tix); i < C; i += int(block_size))
+    {
+        int idx = bt_offset + i;
+        float x = inp [idx];
+        float dy = dout [idx];
+        float gamma = weight [i];
+
+        if (isnan(dy) || isnan(gamma) || isinf(dy) || isinf(gamma)) continue;
+
+        float xhat = (x - mean_bt) * rstd_bt; //normalized activation
+        float dnorm = gamma * dy;
+
+        dnorm_sum += dnorm;
+        dnorm_xhat_sum += dnorm * xhat;
+
+        atomic_fetch_add_explicit(&dbias [i], dy, memory_order_relaxed);
+        atomic_fetch_add_explicit(&dweight[i], dy * xhat, memory_order_relaxed);
+    }
+
+    //warp level reduction
+    float warp_sum = simd_sum(dnorm_sum);
+    float warp_xhat_sum = simd_sum(dnorm_xhat_sum);
+
+    //lane 0 of each warp stores its subttoal into shared memory
+    threadgroup float *buf_sum = shared_mem;
+    threadgroup float *buf_xhat_sum = shared_mem + simd_groups_per_block;
+
+    if (simd_lane_id == 0)
+    {
+        buf_sum [simd_group_id] = warp_sum;
+        buf_xhat_sum[simd_group_id] = warp_xhat_sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    //cross warp reduction
+    /*
+    float block_sum = (tix < simd_groups_per_block) ? buf_sum [tix] : 0.0f;
+    float block_xhat_sum = (tix < simd_groups_per_block) ? buf_xhat_sum[tix] : 0.0f;
+    */
+
+    uint lanes_active = (simd_groups_per_block < simd_size) ? simd_groups_per_block : simd_size;
+
+    float block_sum = (tix < lanes_active) ? buf_sum [tix] : 0.0f;
+    float block_xhat_sum = (tix < lanes_active) ? buf_xhat_sum[tix] : 0.0f;
+
+    if (simd_group_id == 0)
+    {
+        block_sum = simd_sum(block_sum);
+        block_xhat_sum = simd_sum(block_xhat_sum);
+    }
+
+    // thread 0 computes the two means and broadcasts them
+    if (tix == 0)
+    {
+        buf_sum [0] = block_sum / float(C);
+        buf_xhat_sum [0] = block_xhat_sum / float (C);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float mean_dnorm = buf_sum[0];
+    float mean_dnorm_xhat = buf_xhat_sum[0];
+
+    //sanity check
+    if (isnan(mean_dnorm) || isnan(mean_dnorm_xhat) ||
+        isinf(mean_dnorm) || isinf(mean_dnorm_xhat)) return;
+
+    for (int i = int(tix); i < C; i+= int(block_size))
+    {
+        int idx = bt_offset + i;
+        float x = inp [idx];
+        float dy = dout[idx];
+        float gamma = weight[i];
+
+        if (isnan(dy) || isnan(gamma) || isinf(dy) || isinf(gamma)) continue;
+
+        float xhat = (x - mean_bt) * rstd_bt;
+        float dnorm = gamma * dy;
+
+        float dx = (dnorm - mean_dnorm - xhat * mean_dnorm_xhat) * rstd_bt;
+
+        if (!isnan(dx) && !isinf(dx))
+            atomic_fetch_add_explicit(&dinp[idx], dx, memory_order_relaxed);
+    }
+}
+
+/*
+    GELU backward computes dinp[i] += GELU'(x[i] * dout[i])
+
+    Threading model 1D grid, gid ranges from[0, N)
+    Inputs: inp -original forward-pass activations (x)
+            dout - incoming gradient from next layer (dy)
+
+    Output: dinp - gradient wrt x
+*/
+
+#define GELU_SCALING_FACTOR sqrt(2.0f/M_PI_F)
+
+kernel void gelu_backward_kernel(
+    device float *dinp,
+    device const float* inp,
+    device const float* dout,
+    constant const int &N,
+    uint gid [[thread_position_in_grid]])
+{
+
+    if (gid >= N) return;
+
+    float x = inp[gid]; //forward activation
+    float dy = dout[gid]; //upstream gradient
+
+    // now evaluate GELU'
+
+    float x2 = x * x;
+    float x3_term = 0.044715f * x2 * x;
+    float s = GELU_SCALING_FACTOR * (x + x3_term);
+
+    float tanh_s = tanh(s);
+    float cosh_s = cosh(s);
+    float sech2_s = 1.0f / (cosh_s * cosh_s);
+
+    float gelu_grad = 0.5f * (1.0f + tanh_s)
+                + 0.5f * x * sech2_s * GELU_SCALING_FACTOR * (1.0f + 3.0f * 0.044715 * x2);
+
+    //accumulate into dinp
+    dinp[gid] += gelu_grad * dy;
+}
+
+/*
+    softmax backward for attention scores
+    each thread --> exactly one element dprpeatt[row, i]
+
+*/
+
+kernel void softmax_backward_attn_kernel(
+    device float *dpreatt,
+    device const float *datt,
+    device const float * att,
+    constant int  &N,
+    constant int  &T_dim,
+    uint gid [[thread_position_in_grid]])
+{
+    int row = gid / T_dim;
+    int i = gid % T_dim;
+
+    if (row >= N) return;
+
+    const device float * att_row = att + row * T_dim;
+    const device float * datt_row = datt + row * T_dim;
+    device float * dp_row = dpreatt + row * T_dim;
+
+    float acc = 0.0f;
+    float att_i = att_row[i];
+    for (int j = 0; j < T_dim; j++)
+    {
+        float indicator = (j == i)? 1.0f: 0.0f;
+        acc += att_row[j] * (indicator - att_i) * datt_row[j];
+    }
+
+    dp_row[i] = acc;
+}
+
+/*
+    encoder backward: accumuate dWTE  and DWPE
+    Each thread -_>> compute one element of dout (dt, ch)
+    Grid.x = C, Grid.y = B * T
+*/
+
+kernel void encoder_backward_kernel(
+    device atomic_float *dwte, // [V, C]
+    device atomic_float *dwpe, // [T, C]
+    device const float * dout, // [B*T, C]
+    device const int *inp, // token IDs [B*T]
+    constant const int &B,
+    constant const int &T,
+    constant const int &C,
+    uint2 gid [[thread_position_in_grid]])
+{
+    uint i = gid.x; //channel (0 .. C-1)
+    long bt = gid.y; // flattened (b, t) --> index (0...B*T - 1)
+    if (i >= C || bt >= B*T) return;
+
+    float d = dout[bt * C + i]; //upstream gradient
+
+    //token embedding gradient
+    int token_id = inp[bt]; //vocabulary index
+    size_t wte_index = size_t(token_id) * C + i;
+    atomic_fetch_add_explicit(&dwte[wte_index], d, memory_order_relaxed);
+
+    // positional embedding gradient
+    uint pos = bt % T; // 0 .. T -1
+    size_t wpe_index = size_t(pos) * C + i;
+    atomic_fetch_add_explicit(&dwpe[wpe_index], d, memory_order_relaxed);
+}
+
+kernel void adamw_kernel_opt(
+    device float *params,
+    device const float *grads,
+    device float *m_memory,
+    device float *v_memory,
+    constant const float &lr,
+    constant const float &beta1,
+    constant const float &beta2,
+    constant const float &eps,
+    constant const float &wd,
+    constant const uint &num_params,
+    constant const float &m_corr,
+    constant const float &v_corr,
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= num_params) return;
+
+    float p = params[gid];
+    float g = grads [gid];
+    float m = m_memory[gid];
+    float v = v_memory[gid];
+
+    if (!isfinite(p) || !isfinite(g) || !isfinite(m) || !isfinite(v)) return;
+
+    m = fma(beta1, m, (1.0f - beta1) * g);
+    v = fma(beta2, v, (1.0f - beta2) * (g * g));
+
+    m_memory[gid] = m;
+    v_memory[gid] = v;
+
+    float m_hat = m * m_corr;
+    float v_hat = v * v_corr;
+
+    if (!isfinite(m_hat) || !isfinite(v_hat) || v_hat < 0.0f) return;
+
+    float denom = sqrt(v_hat) + eps;
+    if (!isfinite(denom) || denom < 1e-10f) return;
+
+    float update = fma(wd, p, m_hat/denom);
+    params[gid] = fma(-lr, update, p);
+}
+
+kernel void residual_backward_kernel(
+    device float *dinp1,
+    device float *dinp2,
+    device const float *dout,
+    constant const int &N,
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= N) return;
+
+    float dy = dout [gid]; //upstream gradient
+    dinp1[gid] += dy;
+    dinp2[gid] += dy;
+}
+
+kernel void initialize_dlosses_kernel(
+    device float * dlosses,
+    constant const float &val,
+    constant const int &N,
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid < N) dlosses[gid] = val;
+}
+
+kernel void sum_squares_kernel(
+    device  const float*  grads                  [[buffer(0)]],
+    device  atomic_float* result_sum_sq         [[buffer(1)]], // single float
+    constant const uint&  N                     [[buffer(2)]], // total elements
+
+    uint           tix                [[thread_index_in_threadgroup]],
+    uint           gid                [[thread_position_in_grid]],
+    ushort         block_size         [[threads_per_threadgroup]],
+    uint           grid_size          [[threads_per_grid]],
+
+    uint           simd_lane_id       [[thread_index_in_simdgroup]],
+    uint           simd_group_id      [[simdgroup_index_in_threadgroup]],
+    uint           simd_groups_per_block [[simdgroups_per_threadgroup]],
+
+    threadgroup float* shared_mem     [[threadgroup(0)]])
+{
+       float thread_sum_sq = 0.0f;
+    for (uint i = gid; i < N; i += grid_size) {
+        float g = grads[i];
+        if (isfinite(g)) thread_sum_sq = fma(g, g, thread_sum_sq);
+    }
+
+    float simd_group_sum = simd_sum(thread_sum_sq);        // built-in
+
+    if (simd_lane_id == 0)
+        shared_mem[simd_group_id] = simd_group_sum;
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float block_sum_sq = (tix < simd_groups_per_block) ? shared_mem[tix] : 0.0f;
+
+    if (simd_group_id == 0)
+        block_sum_sq = simd_sum(block_sum_sq);             // now lane 0 holds sum
+
+    if (tix == 0 && isfinite(block_sum_sq))
+        atomic_fetch_add_explicit(result_sum_sq,
+                                  block_sum_sq,
+                                  memory_order_relaxed);
+}
