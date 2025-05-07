@@ -40,20 +40,12 @@
 #define min(a, b) ((a) < (b) ? (a) : (b))
 #define max(a, b) ((a) > (b) ? (a) : (b))
 
-//runtime scratch buffers for grad-clipping
-
-//actual L2-norm
-static float* grad_norm_sqrt_result_buffer = NULL;
 /*
  * This will hold the sum of squares of all parameter-gradients produced in teh current step
  *  The reduction kernel sum_squares_kernel needs a place in global memory where every thread-group
  *  can automatically add its partial result.
  */
 static float* grad_norm_sum_sq_buffer = NULL;
-/*
- * The multiplicative factor that rescales every gradient when global-norm clipping is enabled.
- */
-static float* clip_scale_factor_buffer = NULL;
 
 void logFloats(float *a, size_t len) {
   for (int i = 0; i < len; i++) {
@@ -813,6 +805,7 @@ void gpt2_build_from_checkpoint(GPT2 *model, char *checkpoint_path) {
 
   // other inits
   model->acts_memory = NULL;
+  model->acts_memory = NULL;
   model->grads_memory = NULL;
   model->m_memory = NULL;
   model->v_memory = NULL;
@@ -822,6 +815,36 @@ void gpt2_build_from_checkpoint(GPT2 *model, char *checkpoint_path) {
   model->batch_size = 0;
   model->seq_len = 0;
   model->mean_loss = -1.0f; // -1.0f will designate no loss
+}
+
+static void attention_backward(
+    float *dpreatt,
+      float * dQ, float *dK, float *dV,
+      float * dproj_qkv, const float* datt, const float *att, const float *Q, const float *K, const float *V,
+        int B, int T, int NH, int HS)
+{
+
+    const size_t rows_preatt = B * NH * T;
+    const size_t elems_preatt = rows_preatt * T;
+    const size_t batch_count = B * NH;
+
+    launchKernel("softmax_backward_attn_kernel", elems_preatt, 0, 0, 5, dpreatt,
+              (void*)datt, (void*)att, &rows_preatt, &T);
+
+    const float invS = 1.0f/ sqrtf(HS);
+
+    launchKernel("scale_mask_backward_kernel", elems_preatt,
+      0, 0, 5, dpreatt, (void*)&invS, &B, &NH, &T);
+
+    metalCheck(metalSgemmBatched(
+        false, false, T, T, T, HS, dpreatt, K, dQ, batch_count, 1.0f, 0.0f));
+
+    metalCheck(metalSgemmBatched(
+          true, false, T, T, T, HS, dpreatt, Q, dK, batch_count, 1.0f, 0.0f));
+
+    const size_t pack_threads = B * NH * T * HS;
+
+    launchKernel("merge_qkv_grads_kernel", pack_threads, 0, 0, 8, dQ, dK, dV, dproj_qkv, &B, &T, &NH, &HS);
 }
 
 void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T) {
@@ -1023,169 +1046,144 @@ void point_activations_metal(ActivationTensors* acts, float* acts_memory, size_t
   }
 }
 
-void gpt2_backward(GPT2 *model) {
+void gpt2_backward(GPT2 *model)
+{
+    if (model->grads_memory == NULL) {
+        printf("Allocating gradient and optimizer state memory\n");
+        const size_t grads_size      = (size_t)model->num_parameters  * sizeof(float);
+        const size_t grads_acts_size = (size_t)model->num_activations * sizeof(float);
+        metalCheck(metalMalloc((void **)&model->grads_memory, grads_size));
+        point_parameters_metal(&model->grads, model->grads_memory, model->param_sizes);
+        metalCheck(metalClearBuffer(model->grads_memory, grads_size));
+        metalCheck(metalMalloc((void **)&model->grads_acts_memory, grads_acts_size));
+        point_activations_metal(&model->grads_acts, model->grads_acts_memory, model->act_sizes);
+        metalCheck(metalClearBuffer(model->grads_acts_memory, grads_acts_size));
+        metalCheck(metalMalloc((void **)&model->m_memory, grads_size));
+        metalCheck(metalMalloc((void **)&model->v_memory, grads_size));
+        metalCheck(metalClearBuffer(model->m_memory, grads_size));
+        metalCheck(metalClearBuffer(model->v_memory, grads_size));
 
-  //  Lazy Allocation of Gradient Buffers
-  if (model->grads_memory == NULL) {
-    printf("Allocating gradient and optimizer state memory\n");
-
-    // Two contiguous chunks, one for parameter gradients and one for activation (inter-layer) gradients
-    const size_t grads_size      = model->num_parameters  * sizeof(float);
-    const size_t grads_acts_size = model->num_activations * sizeof(float);
-
-    metalCheck(metalMalloc((void **)&model->grads_memory, grads_size));
-
-    //point pointers to pieces of these chunks to appropriate tensors
-    point_parameters_metal(&model->grads,
-                           model->grads_memory,
-                           model->param_sizes);
-
-    metalCheck(metalClearBuffer(model->grads_memory, grads_size));
-    metalCheck(metalMalloc((void **)&model->grads_acts_memory,
-                           grads_acts_size));
-    point_activations_metal(&model->grads_acts,
-                            model->grads_acts_memory,
-                            model->act_sizes);
-
-    metalCheck(metalClearBuffer(model->grads_acts_memory,
-                                grads_acts_size));
-
-    //AdamW moment buffers
-    metalCheck(metalMalloc((void **)&model->m_memory, grads_size));
-    metalCheck(metalMalloc((void **)&model->v_memory, grads_size));
-    metalCheck(metalClearBuffer(model->m_memory, grads_size));
-    metalCheck(metalClearBuffer(model->v_memory, grads_size));
-
-    printf("Gradient, activations, M and V buffers allocated and zero-initialised.\n");
-  }
-
-    int B = model->batch_size;
-    int T = model->seq_len;
-    int V = model->config.vocab_size;
-    int L = model->config.num_layers;
-    int NH = model->config.num_heads;
-    int C = model->config.channels;
-
-    //pointers to weights
-    ParameterTensors params = model->params;
-    //Pointers to parameter gradient buffers
-    ParameterTensors grads = model->grads;
-    //pointers to forward activation buffers
-    ActivationTensors acts = model->acts;
-    //pointers to activation's gradient buffers
-    ActivationTensors grads_acts = model->grads_acts;
-
-
-    // Step 1 --> Initialize dlosses gradient buffer
-    initialize_dlosses(grads_acts.losses, B, T);
-
-    // Step 2 --> Backprop through CrossEntropy and Softmax
-    crossentropy_softmax_backward(model);
-
-    // Step 3 --> Backprop through final MatMul (classifier) -> dLNF, dWTE
-    matmul_backward(grads_acts.lnf, grads.wte, NULL,
-                    grads_acts.logits, acts.lnf, params.wte,
-                    B, T, C, V);
-
-    // Step 4 --> Backprop through final LayerNorm
-    float* final_residual = acts.residual3 + (L - 1) * B * T * C; // Input to lnf
-    float* dgrad_residual3_last = grads_acts.residual3 + (L - 1) * B * T * C; // Gradient flowing OUT of lnf_backward
-    layernorm_backward(dgrad_residual3_last, grads.lnfw, grads.lnfb, // Gradients for lnf weights/bias
-                       grads_acts.lnf,      // Gradient flowing INTO lnf_backward
-                       final_residual,      // Forward input to lnf
-                       params.lnfw,         // Forward lnf weight
-                       acts.lnf_mean,       // Forward lnf mean
-                       acts.lnf_rstd,       // Forward lnf rstd
-                       B, T, C);            // Dimensions
-
-    // Loop through L layers in reverse
-    for (int l = L - 1; l >= 0; l--) {
-        float* l_ln1w = params.ln1w + l * C; float* dl_ln1w = grads.ln1w + l * C;
-        float* l_ln1b = params.ln1b + l * C; float* dl_ln1b = grads.ln1b + l * C;
-        float* l_qkvw = params.qkvw + l * 3*C * C; float* dl_qkvw = grads.qkvw + l * 3*C * C;
-        float* l_qkvb = params.qkvb + l * 3*C; float* dl_qkvb = grads.qkvb + l * 3*C;
-        float* l_attprojw = params.attprojw + l * C * C; float* dl_attprojw = grads.attprojw + l * C * C;
-        float* l_attprojb = params.attprojb + l * C; float* dl_attprojb = grads.attprojb + l * C;
-        float* l_ln2w = params.ln2w + l * C; float* dl_ln2w = grads.ln2w + l * C;
-        float* l_ln2b = params.ln2b + l * C; float* dl_ln2b = grads.ln2b + l * C;
-        float* l_fcw = params.fcw + l * 4*C * C; float* dl_fcw = grads.fcw + l * 4*C * C;
-        float* l_fcb = params.fcb + l * 4*C; float* dl_fcb = grads.fcb + l * 4*C;
-        float* l_fcprojw = params.fcprojw + l * C * 4*C; float* dl_fcprojw = grads.fcprojw + l * C * 4*C;
-        float* l_fcprojb = params.fcprojb + l * C; float* dl_fcprojb = grads.fcprojb + l * C;
-
-        // Get pointers to activations and their gradients for layer l
-        float* l_residual_in = (l == 0) ? acts.encoded : acts.residual3 + (l - 1) * B * T * C;
-        float* dl_residual_in_grad = (l == 0) ? grads_acts.encoded : grads_acts.residual3 + (l - 1) * B * T * C;
-        float* l_ln1 = acts.ln1 + l*B*T*C; float* dl_ln1 = grads_acts.ln1 + l*B*T*C;
-        float* l_ln1_mean = acts.ln1_mean + l*B*T; float* l_ln1_rstd = acts.ln1_rstd + l*B*T;
-        float* l_qkv = acts.qkv + l*B*T*3*C; float* dl_qkv = grads_acts.qkv + l*B*T*3*C;
-        float* l_atty = acts.atty + l*B*T*C; float* dl_atty = grads_acts.atty + l*B*T*C;
-        float* l_attproj = acts.attproj + l*B*T*C; float* dl_attproj = grads_acts.attproj + l*B*T*C;
-        float* l_residual2 = acts.residual2 + l*B*T*C; float* dl_residual2 = grads_acts.residual2 + l*B*T*C;
-        float* l_ln2 = acts.ln2 + l*B*T*C; float* dl_ln2 = grads_acts.ln2 + l*B*T*C;
-        float* l_ln2_mean = acts.ln2_mean + l*B*T; float* l_ln2_rstd = acts.ln2_rstd + l*B*T;
-        float* l_fch = acts.fch + l*B*T*4*C; float* dl_fch = grads_acts.fch + l*B*T*4*C;
-        float* l_fch_gelu = acts.fch_gelu + l*B*T*4*C; float* dl_fch_gelu = grads_acts.fch_gelu + l*B*T*4*C;
-        float* l_fcproj = acts.fcproj + l*B*T*C; float* dl_fcproj = grads_acts.fcproj + l*B*T*C;
-        float* l_residual3 = acts.residual3 + l*B*T*C; float* dl_residual3 = grads_acts.residual3 + l*B*T*C;
-
-
-        // Backprop through Residual 3 addition
-        residual_backward(dl_residual2, dl_fcproj, dl_residual3, B*T*C);
-        matmul_backward(dl_fch_gelu, dl_fcprojw, dl_fcprojb,
-                        dl_fcproj, l_fch_gelu, l_fcprojw,
-                        B, T, 4*C, C);
-
-        int N_gelu = B * T * 4 * C;
-        gelu_backward(dl_fch, l_fch, dl_fch_gelu, N_gelu);
-
-        matmul_backward(dl_ln2, dl_fcw, dl_fcb,
-                        dl_fch, l_ln2, l_fcw,
-                        B, T, C, 4*C);
-
-        layernorm_backward(dl_residual2, dl_ln2w, dl_ln2b,
-                           dl_ln2, l_residual2, l_ln2w,
-                           l_ln2_mean, l_ln2_rstd,
-                           B, T, C);
-
-        // Backprop through Residual 2 addition
-        residual_backward(dl_residual_in_grad, dl_attproj, dl_residual2, B*T*C);
-
-        // Backprop through Attention projection matmul -> computes dl_atty, dl_attprojw, dl_attprojb
-        matmul_backward(dl_atty, dl_attprojw, dl_attprojb,
-                        dl_attproj, l_atty, l_attprojw,
-                        B, T, C, C);
-
-        // Backprop through QKV matmul
-        matmul_backward(dl_ln1, dl_qkvw, dl_qkvb,
-                        dl_qkv, l_ln1, l_qkvw,
-                        B, T, C, 3*C);
-
-        //Backprop through LayerNorm 1 (ln1) -> computes dl_residual_in_grad (accumulates), dl_ln1w, dl_ln1b
-        layernorm_backward(dl_residual_in_grad, dl_ln1w, dl_ln1b,
-                           dl_ln1, l_residual_in, l_ln1w,
-                           l_ln1_mean, l_ln1_rstd,
-                           B, T, C);
-      metalCommitCommands();
+        printf("Gradient, activation‑gradient, M and V buffers allocated.\n");
     }
 
-  //Backprop through Encoder
-  encoder_backward(grads.wte, grads.wpe, grads_acts.encoded, model->inputs, B, T, C);
-  metalCommitCommandsAndWait();
+    const int B  = model->batch_size;
+    const int T  = model->seq_len;
+    const int V  = model->config.vocab_size;
+    const int L  = model->config.num_layers;
+    const int NH = model->config.num_heads;
+    const int C  = model->config.channels;
+    const int HS = C / NH;
+
+    ParameterTensors   P  = model->params;
+    ParameterTensors   dP = model->grads;
+    ActivationTensors  A  = model->acts;
+    ActivationTensors  dA = model->grads_acts;
+
+    initialize_dlosses(dA.losses, B, T);
+    crossentropy_softmax_backward(model);
+
+    matmul_backward(dA.lnf, dP.wte, NULL,
+                    dA.logits, A.lnf, P.wte,
+                    B, T, C, V);
+
+    float *final_res   = A.residual3 + (L-1)*B*T*C;
+    float *d_final_res = dA.residual3 + (L-1)*B*T*C;
+    layernorm_backward(d_final_res, dP.lnfw, dP.lnfb,
+                       dA.lnf, final_res, P.lnfw,
+                       A.lnf_mean, A.lnf_rstd, B, T, C);
+
+    for (int l = L-1; l >= 0; --l) {
+
+#define SLICE(ptr, off, n)  ((ptr) + (off)*(n))
+
+        float *ln1w  = SLICE(P.ln1w,  l, C);      float *d_ln1w  = SLICE(dP.ln1w,  l, C);
+        float *ln1b  = SLICE(P.ln1b,  l, C);      float *d_ln1b  = SLICE(dP.ln1b,  l, C);
+        float *qkvw  = SLICE(P.qkvw,  l, 3*C*C);  float *d_qkvw  = SLICE(dP.qkvw,  l, 3*C*C);
+        float *qkvb  = SLICE(P.qkvb,  l, 3*C);    float *d_qkvb  = SLICE(dP.qkvb,  l, 3*C);
+        float *attpw = SLICE(P.attprojw, l, C*C); float *d_attpw = SLICE(dP.attprojw, l, C*C);
+        float *attpb = SLICE(P.attprojb, l, C);   float *d_attpb = SLICE(dP.attprojb, l, C);
+        float *ln2w  = SLICE(P.ln2w,  l, C);      float *d_ln2w  = SLICE(dP.ln2w,  l, C);
+        float *ln2b  = SLICE(P.ln2b,  l, C);      float *d_ln2b  = SLICE(dP.ln2b,  l, C);
+        float *fcw   = SLICE(P.fcw,   l, 4*C*C);  float *d_fcw   = SLICE(dP.fcw,   l, 4*C*C);
+        float *fcb   = SLICE(P.fcb,   l, 4*C);    float *d_fcb   = SLICE(dP.fcb,   l, 4*C);
+        float *fcpw  = SLICE(P.fcprojw,l, C*4*C); float *d_fcpw  = SLICE(dP.fcprojw,l,C*4*C);
+        float *fcpb  = SLICE(P.fcprojb,l, C);     float *d_fcpb  = SLICE(dP.fcprojb,l, C);
+
+        float *res_in    = (l==0)? A.encoded : SLICE(A.residual3,l-1,B*T*C);
+        float *d_res_in  = (l==0)? dA.encoded: SLICE(dA.residual3,l-1,B*T*C);
+        float *ln1       = SLICE(A.ln1,  l, B*T*C);   float *d_ln1       = SLICE(dA.ln1,  l, B*T*C);
+        float *ln1_mean  = SLICE(A.ln1_mean, l, B*T); float *ln1_rstd    = SLICE(A.ln1_rstd,l,B*T);
+        float *qkv       = SLICE(A.qkv,  l, B*T*3*C); float *d_qkv       = SLICE(dA.qkv,  l, B*T*3*C);
+        float *atty      = SLICE(A.atty, l, B*T*C);   float *d_atty      = SLICE(dA.atty, l, B*T*C);
+        float *attproj   = SLICE(A.attproj,l,B*T*C);  float *d_attproj   = SLICE(dA.attproj,l,B*T*C);
+        float *res2      = SLICE(A.residual2,l,B*T*C);float *d_res2      = SLICE(dA.residual2,l,B*T*C);
+        float *ln2       = SLICE(A.ln2,  l, B*T*C);   float *d_ln2       = SLICE(dA.ln2,  l, B*T*C);
+        float *ln2_mean  = SLICE(A.ln2_mean, l,B*T);  float *ln2_rstd    = SLICE(A.ln2_rstd,l,B*T);
+        float *fch       = SLICE(A.fch,  l, B*T*4*C); float *d_fch       = SLICE(dA.fch,  l, B*T*4*C);
+        float *gelu      = SLICE(A.fch_gelu,l,B*T*4*C);float *d_gelu     = SLICE(dA.fch_gelu,l,B*T*4*C);
+        float *fcproj    = SLICE(A.fcproj,l,B*T*C);    float *d_fcproj    = SLICE(dA.fcproj,l,B*T*C);
+        float *res3      = SLICE(A.residual3,l,B*T*C); float *d_res3      = SLICE(dA.residual3,l,B*T*C);
+
+#undef SLICE
+        residual_backward(d_res2, d_fcproj, d_res3, B*T*C);
+        matmul_backward(d_gelu, d_fcpw, d_fcpb,
+                        d_fcproj, gelu, fcpw,
+                        B, T, 4*C, C);
+
+        gelu_backward(d_fch, fch, d_gelu, B*T*4*C);
+        matmul_backward(d_ln2, d_fcw, d_fcb,
+                        d_fch, ln2, fcw,
+                        B, T, C, 4*C);
+
+        layernorm_backward(d_res2, d_ln2w, d_ln2b,
+                           d_ln2, res2, ln2w,
+                           ln2_mean, ln2_rstd, B, T, C);
+
+        residual_backward(d_res_in, d_attproj, d_res2, B*T*C);
+
+        matmul_backward(d_atty, d_attpw, d_attpb,
+                        d_attproj, atty, attpw,
+                        B, T, C, C);
+
+        float *Q   = qkv + 0;
+        float *K   = Q   + B*NH*T*HS;
+        float *V   = K   + B*NH*T*HS;
+        float *dQ  = d_qkv + 0;
+        float *dK  = dQ + B*NH*T*HS;
+        float *dV  = dK + B*NH*T*HS;
+
+        attention_backward(dA.preatt + l*B*NH*T*T,
+                           dQ, dK, dV,
+                           d_qkv,
+                           dA.datt + l*B*NH*T*T,
+                           A.att + l*B*NH*T*T,
+                           Q, K, V,
+                           B, T, NH, HS);
+
+        matmul_backward(d_ln1, d_qkvw, d_qkvb,
+                        d_qkv, ln1, qkvw,
+                        B, T, C, 3*C);
+      layernorm_backward(d_res_in, d_ln1w, d_ln1b,
+                           d_ln1, res_in, ln1w,
+                           ln1_mean, ln1_rstd, B, T, C);
+
+        metalCommitCommands();
+    }
+    encoder_backward(dP.wte, dP.wpe, dA.encoded, model->inputs, B, T, C);
+    metalCommitCommandsAndWait();
 }
 
 void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2,
                  float eps, float weight_decay, int t)
 {
     uint32_t num_parameters = (uint32_t)model->num_parameters;
-    if (model->m_memory == NULL || model->v_memory == NULL || grad_norm_sum_sq_buffer == NULL || clip_scale_factor_buffer == NULL) {
+    if (model->m_memory == NULL || model->v_memory == NULL) {
         printf("Allocating gradient, optimizer state, and clipping buffers...\n");
         size_t grads_size = model->num_parameters * sizeof(float);
         if (!model->grads_memory) { metalCheck(metalMalloc((void**)&model->grads_memory, grads_size)); point_parameters_metal(&model->grads, model->grads_memory, model->param_sizes); }
         if (!model->m_memory) { metalCheck(metalMalloc((void**)&model->m_memory, grads_size)); metalCheck(metalClearBuffer(model->m_memory, grads_size)); }
         if (!model->v_memory) { metalCheck(metalMalloc((void**)&model->v_memory, grads_size)); metalCheck(metalClearBuffer(model->v_memory, grads_size)); }
         if (!grad_norm_sum_sq_buffer) { metalCheck(metalMalloc((void**)&grad_norm_sum_sq_buffer, sizeof(float))); }
-        if (!clip_scale_factor_buffer) { metalCheck(metalMalloc((void**)&clip_scale_factor_buffer, sizeof(float))); }
     }
 
     //adamw update
@@ -1440,11 +1438,13 @@ int main(void) {
               "layernorm_backward_kernel",
               "residual_backward_kernel",
               "gelu_backward_kernel",
-              "softmax_backward_attn_kernel",
               "encoder_backward_kernel",
-              "sum_squares_kernel",
               "adamw_kernel",
               "initialize_dlosses_kernel",
+              "scale_mask_backward_kernel",
+              "softmax_backward_attn_kernel",
+              "merge_qkv_grads_kernel",
+              "sum_squares_kernel",
               NULL);
 
   // build the DataLoaders from tokens files. for now use tiny_shakespeare if
@@ -1485,7 +1485,7 @@ int main(void) {
 
   // train
   struct timespec start, end;
-  for (int step = 0; step <= 40; step++) {
+  for (int step = 0; step <= 100; step++) {
     // once in a while estimate the validation loss
     if (step % 10 == 0) {
       float val_loss = 0.0f;
@@ -1535,7 +1535,22 @@ int main(void) {
     // these are still TODO
     gpt2_zero_grad(&model);
     gpt2_backward(&model);
-    gpt2_update(&model, 3e-5f, 0.9f, 0.999f, 1e-8f, 0.0f, step+1);
+    if (grad_norm_sum_sq_buffer == NULL)
+    {
+      metalCheck(metalMalloc((void**)&grad_norm_sum_sq_buffer, sizeof(float)));
+
+    }
+    metalCheck(metalClearBuffer(grad_norm_sum_sq_buffer, sizeof(float)));
+    int grid = model.num_parameters;
+    int block = 256;
+    block = (grid<block) ? grid : block;
+    size_t shared_mem = block/32 * sizeof(float);
+    launchKernel("sum_squares_kernel",
+                 grid, block, shared_mem,
+                 3,
+                 Buffer, model.grads_memory,Buffer, grad_norm_sum_sq_buffer,Scalar,&grid);
+
+    gpt2_update(&model, 4e-5f, 0.9f, 0.999f, 1e-8f, 0.0f, step+1);
     clock_gettime(CLOCK_MONOTONIC, &end);
     double time_elapsed_s =
         (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;

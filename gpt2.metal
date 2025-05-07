@@ -982,3 +982,52 @@ kernel void sum_squares_kernel(
                                   block_sum_sq,
                                   memory_order_relaxed);
 }
+
+kernel void merge_qkv_grads_kernel(
+    const device float *dq [[buffer(0)]],
+    const device float *dk [[buffer(1)]],
+    const device float *dv [[buffer(2)]],
+    device float *dproj_qkv [[buffer(3)]],
+    constant uint &B [[buffer(4)]],
+    constant uint &T [[buffer(5)]],
+    constant uint &NH [[buffer(6)]],
+    constant uint &HS [[buffer(7)]],
+    uint gid [[thread_position_in_grid]])
+{
+    const uint stride_qkv = NH * HS;
+    const uint elems_per_batch = 3 * stride_qkv * T;
+
+    uint bh = gid / (T * HS);
+    uint rest = gid % (T * HS);
+    uint t = rest / HS;
+    uint hsi = rest % HS;
+
+    uint b = bh / NH;
+    uint h = bh % NH;
+
+    const uint base_out = b * elems_per_batch + t* (3 * stride_qkv) + hsi + h * HS;
+
+    dproj_qkv[base_out] = dq[gid];
+    dproj_qkv[base_out + stride_qkv] = dk[gid];
+    dproj_qkv[base_out + 2 * stride_qkv] = dv [gid];
+}
+
+kernel void scale_mask_backward_kernel(
+    device float* dpreatt [[buffer(0)]],
+    constant float &invS [[buffer(1)]],
+    constant uint &B [[buffer(2)]],
+    constant uint &NH [[buffer(3)]],
+    constant uint &T [[buffer(4)]],
+    uint tid [[thread_position_in_grid]])
+{
+    const uint row = tid / T;
+    const uint i  = tid % T;
+
+    const uint t2 = row % T;
+
+    float g = dpreatt[tid] * invS;
+
+    if (i > t2) g = 0.0f;
+
+    dpreatt[tid] = g;
+}
