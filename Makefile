@@ -1,5 +1,5 @@
 CC ?= clang
-CFLAGS = -Ofast -Wno-unused-result -Wno-ignored-pragmas -Wno-unknown-attributes
+CFLAGS = -O3 -fno-finite-math-only -Wno-unused-result -Wno-ignored-pragmas -Wno-unknown-attributes
 LDFLAGS =
 LDLIBS = -lm
 INCLUDES =
@@ -98,7 +98,7 @@ all: $(TARGETS)
 
 # Build the train gpt2 metal target. Need to link the appropriate Metal Obj-C frameworks.
 train_gpt2_metal: train_gpt2_metal.c metal_compute.m llm_cpu.c | default.metallib
-	clang -Ofast -Imetal_compute.h -framework Foundation -framework Metal -framework MetalPerformanceShaders $^ -o $@
+	clang -O3 -fno-finite-math-only -Imetal_compute.h -framework Foundation -framework Metal -framework MetalPerformanceShaders $^ -o $@
 
 train_gpt2: train_gpt2.c
 	$(CC) $(CFLAGS) $(INCLUDES) $(LDFLAGS) $< $(LDLIBS) -o $@
