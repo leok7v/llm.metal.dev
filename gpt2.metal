@@ -505,9 +505,9 @@ kernel void matmul_backward_bias_kernel(
     //upstream gradient tensor flattened as (B*T*OC)
     device const float *dout [[buffer(1)]],
 
-    constant int& B [[buffer(2)]],
-    constant int& T [[buffer(3)]],
-    constant int& OC [[buffer(4)]],
+    constant uint& B [[buffer(2)]],
+    constant uint& T [[buffer(3)]],
+    constant uint& OC [[buffer(4)]],
 
     //threadgroup 0's scratchpad memory (c uda smem per block) bug enough for VEC_SIZE * simd_groups_per_block floats
     threadgroup float* local_sums [[threadgroup(0)]],
@@ -782,7 +782,7 @@ kernel void gelu_backward_kernel(
     device atomic_float *dinp,
     device const float* inp,
     device const float* dout,
-    constant const int &N,
+    constant const uint &N,
     uint gid [[thread_position_in_grid]])
 {
 
@@ -853,10 +853,10 @@ kernel void encoder_backward_kernel(
     device atomic_float *dwte, // [V, C]
     device atomic_float *dwpe, // [T, C]
     device const float * dout, // [B*T, C]
-    device const int *inp, // token IDs [B*T]
-    constant const int &B,
-    constant const int &T,
-    constant const int &C,
+    device const uint *inp, // token IDs [B*T]
+    constant const uint &B,
+    constant const uint &T,
+    constant const uint &C,
     uint2 gid [[thread_position_in_grid]])
 {
     uint i = gid.x; //channel (0 .. C-1)
@@ -922,7 +922,7 @@ kernel void residual_backward_kernel(
     device atomic_float *dinp1,
     device atomic_float *dinp2,
     device const float *dout,
-    constant const int &N,
+    constant const uint &N,
     uint gid [[thread_position_in_grid]])
 {
     if (gid >= N) return;
@@ -937,7 +937,7 @@ kernel void residual_backward_kernel(
 kernel void initialize_dlosses_kernel(
     device float * dlosses,
     constant const float &val,
-    constant const int &N,
+    constant const uint &N,
     uint gid [[thread_position_in_grid]])
 {
     if (gid < N) dlosses[gid] = val;
