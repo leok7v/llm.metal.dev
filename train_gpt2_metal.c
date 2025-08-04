@@ -40,6 +40,8 @@
 #define min(a, b) ((a) < (b) ? (a) : (b))
 #define max(a, b) ((a) > (b) ? (a) : (b))
 
+const float infinity = (__builtin_inff()); // Use built-in infinity to avoid warnings
+
 /*
  * This will hold the sum of squares of all parameter-gradients produced in teh current step
  *  The reduction kernel sum_squares_kernel needs a place in global memory where every thread-group
@@ -85,7 +87,7 @@ int check_tensor(float *a, float *b, size_t n, char *label) {
   printf("%s\n", label);
   for (int i = 0; i < n; i++) {
     if (fabsf(a[i] - b[i]) <= 1e-2 ||
-        (a[i] == -INFINITY && b[i] == -INFINITY)) {
+        (a[i] == -infinity && b[i] == -infinity)) {
       if (i < print_upto) {
         printf("OK ");
       }
@@ -820,7 +822,7 @@ void gpt2_build_from_checkpoint(GPT2 *model, char *checkpoint_path) {
 static void attention_backward(
     float *dpreatt,
       float * dQ, float *dK, float *dV,
-      float * dproj_qkv, const float* datt, const float *att, const float *Q, const float *K, const float *V,
+      float * dproj_qkv, const float* datt, const float *att, float *Q, float *K, const float *V,
         int B, int T, int NH, int HS)
 {
 
@@ -1421,6 +1423,68 @@ void gpt2_zero_grad(GPT2* model)
     metalCheck(metalClearBuffer(model->grads_acts_memory, grads_acts_size));
 
 }
+
+void write_fp32(float *tensor, size_t size, FILE *file) {
+  fwrite(tensor, sizeof(float), size, file); // Simple write; assume tensor is contiguous
+}
+
+void write_tensors(GPT2 *model, ParameterTensors *params, int L, FILE *file) {
+  // Match Python's write_tensors order
+  int C = model->config.channels;
+  write_fp32(params->wte, model->param_sizes[0], file);
+  write_fp32(params->wpe, model->param_sizes[1], file);
+  for (int i = 0; i < L; i++) write_fp32(params->ln1w + i * C, C, file);
+  for (int i = 0; i < L; i++) write_fp32(params->ln1b + i * C, C, file);
+  for (int i = 0; i < L; i++) write_fp32(params->qkvw + i * 3*C*C, 3*C*C, file);
+  for (int i = 0; i < L; i++) write_fp32(params->qkvb + i * 3*C, 3*C, file);
+  for (int i = 0; i < L; i++) write_fp32(params->attprojw + i * C*C, C*C, file);
+  for (int i = 0; i < L; i++) write_fp32(params->attprojb + i * C, C, file);
+  for (int i = 0; i < L; i++) write_fp32(params->ln2w + i * C, C, file);
+  for (int i = 0; i < L; i++) write_fp32(params->ln2b + i * C, C, file);
+  for (int i = 0; i < L; i++) write_fp32(params->fcw + i * 4*C*C, 4*C*C, file);
+  for (int i = 0; i < L; i++) write_fp32(params->fcb + i * 4*C, 4*C, file);
+  for (int i = 0; i < L; i++) write_fp32(params->fcprojw + i * C*4*C, C*4*C, file);
+  for (int i = 0; i < L; i++) write_fp32(params->fcprojb + i * C, C, file);
+  write_fp32(params->lnfw, C, file);
+  write_fp32(params->lnfb, C, file);
+}
+
+void write_model(GPT2 *model, const char *filename) {
+  FILE *file = fopen(filename, "wb");
+  if (!file) { printf("Failed to open %s\n", filename); return; }
+  int header[256] = {0};
+  header[0] = 20240326; 
+  header[1] = 1;
+  header[2] = model->config.max_seq_len;
+  header[3] = model->config.vocab_size;
+  header[4] = model->config.num_layers;
+  header[5] = model->config.num_heads;
+  header[6] = model->config.channels;
+  fwrite(header, sizeof(int), 256, file);
+  write_tensors(model, &model->params, model->config.num_layers, file);
+  fclose(file);
+  printf("wrote %s\n", filename);
+}
+
+void write_state(GPT2 *model, int *x, int *y, float *logits, float loss, const char *filename) {
+  FILE *file = fopen(filename, "wb");
+  if (!file) { printf("Failed to open %s\n", filename); return; }
+  int header[256] = {0};
+  header[0] = 20240327; 
+  header[1] = 1;
+  header[2] = model->batch_size; 
+  header[3] = model->seq_len;
+  fwrite(header, sizeof(int), 256, file);
+  fwrite(x, sizeof(int), model->batch_size * model->seq_len, file);
+  fwrite(y, sizeof(int), model->batch_size * model->seq_len, file);
+  write_fp32(logits, model->batch_size * model->seq_len * model->config.vocab_size, file);
+  fwrite(&loss, sizeof(float), 1, file);
+  // Write grads (adapt from model->grads)
+  write_tensors(model, &model->grads, model->config.num_layers, file);
+  fclose(file);
+  printf("wrote %s\n", filename);
+}
+
 // ----------------------------------------------------------------------------
 // main training loop
 int main(void) {
